@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { TransactionForm } from '../components/TransactionForm';
 import { Transaction, TransactionType, AccountType, CashAccount, CashMutation, PaymentMethod } from '../types';
 import { useAppData } from '../hooks/useAppData';
+import { LoginView } from '../components/LoginView';
 import { AppHeader } from '../components/layout/AppHeader';
 import { FloatingNavigation } from '../components/layout/FloatingNavigation';
 import { DashboardView } from '../components/views/DashboardView';
@@ -20,9 +21,18 @@ const parseCurrencyInput = (value: string) => {
 
 export default function Home() {
   const { 
-    accounts, setAccounts, 
-    mutations, setMutations, 
-    transactionHistory, setTransactionHistory 
+    user,
+    authLoading,
+    dataLoading,
+    accounts, 
+    mutations, 
+    transactionHistory, 
+    addAccount,
+    updateAccount,
+    removeAccount,
+    processTransactionBatch,
+    processInternalTransfer,
+    processSimpleUpdate
   } = useAppData();
 
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -35,7 +45,6 @@ export default function Home() {
   
   const [isEditingAccount, setIsEditingAccount] = useState<CashAccount | null>(null);
 
-  // Transfer Logic State
   const [transferConfig, setTransferConfig] = useState({
     amount: '',
     description: '',
@@ -46,105 +55,120 @@ export default function Home() {
     chargedTo: 'SOURCE'
   });
 
-  // --- HANDLERS ---
+  // --- LOADING / AUTH STATE ---
+  if (authLoading) return <div className="min-h-screen flex items-center justify-center bg-slate-100"><div className="animate-spin rounded-full h-12 w-12 border-b-2 border-bri-blue"></div></div>;
+  if (!user) return <LoginView />;
 
-  const handleTransactionSubmit = (data: Transaction) => {
-    // 1. Simpan Transaksi
-    const newTrx = { ...data, id: `TRX-${Date.now()}`, date: new Date().toLocaleString() };
-    setTransactionHistory(prev => [newTrx, ...prev]);
+  // --- HANDLERS (UPDATED FOR ASYNC FIREBASE) ---
 
-    // 2. PROSES MUTASI GANDA
+  const handleTransactionSubmit = async (data: Transaction) => {
+    // Construct Transaction Data
+    const newTrx = { 
+       ...data, 
+       date: new Date().toLocaleString() // In real app, use serverTimestamp() inside hook
+    };
+
+    const mutationsToAdd: Omit<CashMutation, 'id'>[] = [];
+    const accountUpdates: { id: string, amount: number }[] = [];
+
+    // PROSES MUTASI GANDA
     if (data.type === TransactionType.TRANSFER_BANK && data.sourceAccountId) {
        // A. MUTASI KELUAR
        const outAmount = data.amount + data.adminFee;
-       const outMutation: CashMutation = {
-         id: `MUT-OUT-${Date.now()}`,
+       mutationsToAdd.push({
          date: new Date().toLocaleString(),
          type: 'OUT',
          amount: outAmount,
          description: `TRX Keluar: ${data.customerName} (${data.provider})`,
          sourceAccountId: data.sourceAccountId
-       };
+       });
+       accountUpdates.push({ id: data.sourceAccountId, amount: -outAmount });
 
        // B. MUTASI MASUK
        const totalTagihan = data.total;
-       const inMutations: CashMutation[] = [];
-
+       
        if (data.paymentMethod === PaymentMethod.TUNAI) {
           const tunaiAcc = accounts.find(a => a.type === AccountType.TUNAI);
           if (tunaiAcc) {
-            inMutations.push({ id: `MUT-IN-${Date.now()}-1`, date: new Date().toLocaleString(), type: 'IN', amount: totalTagihan, description: `Pembayaran Tunai: ${data.customerName}`, destinationAccountId: tunaiAcc.id });
+            mutationsToAdd.push({ date: new Date().toLocaleString(), type: 'IN', amount: totalTagihan, description: `Pembayaran Tunai: ${data.customerName}`, destinationAccountId: tunaiAcc.id });
+            accountUpdates.push({ id: tunaiAcc.id, amount: totalTagihan });
           }
        } else if (data.paymentMethod === PaymentMethod.TRANSFER && data.paymentReceiverId) {
-          inMutations.push({ id: `MUT-IN-${Date.now()}-1`, date: new Date().toLocaleString(), type: 'IN', amount: totalTagihan, description: `Pembayaran Transfer: ${data.customerName}`, destinationAccountId: data.paymentReceiverId });
+          mutationsToAdd.push({ date: new Date().toLocaleString(), type: 'IN', amount: totalTagihan, description: `Pembayaran Transfer: ${data.customerName}`, destinationAccountId: data.paymentReceiverId });
+          accountUpdates.push({ id: data.paymentReceiverId, amount: totalTagihan });
        } else if (data.paymentMethod === PaymentMethod.SPLIT) {
           const cashAmt = parseCurrencyInput(data.splitCashAmount || '0');
           const trfAmt = parseCurrencyInput(data.splitTransferAmount || '0');
           const tunaiAcc = accounts.find(a => a.type === AccountType.TUNAI);
           
-          if (cashAmt > 0 && tunaiAcc) inMutations.push({ id: `MUT-IN-${Date.now()}-1`, date: new Date().toLocaleString(), type: 'IN', amount: cashAmt, description: `Split (Tunai): ${data.customerName}`, destinationAccountId: tunaiAcc.id });
-          if (trfAmt > 0 && data.paymentReceiverId) inMutations.push({ id: `MUT-IN-${Date.now()}-2`, date: new Date().toLocaleString(), type: 'IN', amount: trfAmt, description: `Split (Transfer): ${data.customerName}`, destinationAccountId: data.paymentReceiverId });
+          if (cashAmt > 0 && tunaiAcc) {
+             mutationsToAdd.push({ date: new Date().toLocaleString(), type: 'IN', amount: cashAmt, description: `Split (Tunai): ${data.customerName}`, destinationAccountId: tunaiAcc.id });
+             accountUpdates.push({ id: tunaiAcc.id, amount: cashAmt });
+          }
+          if (trfAmt > 0 && data.paymentReceiverId) {
+             mutationsToAdd.push({ date: new Date().toLocaleString(), type: 'IN', amount: trfAmt, description: `Split (Transfer): ${data.customerName}`, destinationAccountId: data.paymentReceiverId });
+             accountUpdates.push({ id: data.paymentReceiverId, amount: trfAmt });
+          }
        }
-
-       setMutations(prev => [outMutation, ...inMutations, ...prev]);
-       setAccounts(prevAccounts => {
-          return prevAccounts.map(acc => {
-             let newBalance = acc.balance;
-             if (acc.id === outMutation.sourceAccountId) newBalance -= outMutation.amount;
-             inMutations.forEach(m => { if (acc.id === m.destinationAccountId) newBalance += m.amount; });
-             return { ...acc, balance: newBalance };
-          });
-       });
 
     } else {
        // Logic Sederhana (Non-Transfer) -> Masuk ke Tunai
        const tunaiAcc = accounts.find(a => a.type === AccountType.TUNAI);
        if(tunaiAcc) {
-          setAccounts(prev => prev.map(a => a.id === tunaiAcc.id ? {...a, balance: a.balance + data.total} : a));
-          setMutations(prev => [...prev, { id: `MUT-IN-${Date.now()}`, date: new Date().toLocaleString(), type: 'IN', amount: data.total, description: `TRX Masuk: ${data.type}`, destinationAccountId: tunaiAcc.id }]);
+          mutationsToAdd.push({ date: new Date().toLocaleString(), type: 'IN', amount: data.total, description: `TRX Masuk: ${data.type}`, destinationAccountId: tunaiAcc.id });
+          accountUpdates.push({ id: tunaiAcc.id, amount: data.total });
        }
     }
-    setActiveTransactionType(null);
+
+    try {
+      await processTransactionBatch(newTrx, mutationsToAdd, accountUpdates);
+      setActiveTransactionType(null);
+    } catch (e) {
+      console.error("Error saving transaction", e);
+      alert("Gagal menyimpan transaksi. Periksa koneksi internet.");
+    }
   };
 
-  // Account Management Handlers
-  const handleSaveAccount = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleSaveAccount = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
     const type = formData.get('type') as AccountType;
-    const balanceInput = formData.get('balance') as string;
-    const minBalanceInput = formData.get('minimumBalance') as string;
     
     if (type === AccountType.TUNAI && accounts.some(a => a.type === AccountType.TUNAI && a.id !== isEditingAccount?.id)) {
       alert("Hanya boleh ada satu akun Kas Tunai (Fisik).");
       return;
     }
 
-    const accountData: CashAccount = {
-      id: isEditingAccount ? isEditingAccount.id : `ACC-${Date.now()}`,
+    const accountData = {
       name: formData.get('name') as string,
       type: type,
-      balance: parseCurrencyInput(balanceInput),
-      minimumBalance: minBalanceInput ? parseCurrencyInput(minBalanceInput) : undefined,
+      balance: parseCurrencyInput(formData.get('balance') as string),
+      minimumBalance: formData.get('minimumBalance') ? parseCurrencyInput(formData.get('minimumBalance') as string) : undefined,
       accountNumber: formData.get('accountNumber') as string || undefined,
       mdrPercent: type === AccountType.MERCHANT ? Number(formData.get('mdrPercent')) : undefined,
       settlementAccountId: type === AccountType.MERCHANT ? formData.get('settlementAccountId') as string : undefined
     };
 
-    if (isEditingAccount) {
-      setAccounts(accounts.map(acc => acc.id === isEditingAccount.id ? accountData : acc));
-    } else {
-      setAccounts([...accounts, accountData]);
+    try {
+      if (isEditingAccount) {
+        await updateAccount(isEditingAccount.id, accountData);
+      } else {
+        await addAccount(accountData);
+      }
+      setShowAddAccountModal(false);
+      setIsEditingAccount(null);
+    } catch (e) {
+      alert("Gagal menyimpan akun.");
     }
-    setShowAddAccountModal(false);
-    setIsEditingAccount(null);
   };
 
-  const handleDeleteAccount = (id: string) => {
-    if (window.confirm('Yakin ingin menghapus akun ini?')) setAccounts(accounts.filter(a => a.id !== id));
+  const handleDeleteAccount = async (id: string) => {
+    if (window.confirm('Yakin ingin menghapus akun ini? Data tidak bisa dikembalikan.')) {
+       await removeAccount(id);
+    }
   };
 
-  const handleCapitalInjection = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleCapitalInjection = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
     const destId = formData.get('destId') as string;
@@ -153,12 +177,19 @@ export default function Home() {
 
     if (!destId) { alert("Pilih akun tujuan."); return; }
 
-    setAccounts(accounts.map(acc => acc.id === destId ? { ...acc, balance: acc.balance + amount } : acc));
-    setMutations(prev => [...prev, { id: `CAP-${Date.now()}`, date: new Date().toLocaleString(), type: 'CAPITAL_IN', amount: amount, description: desc || 'Tambah Modal', destinationAccountId: destId }]);
+    const mutationData = {
+      date: new Date().toLocaleString(),
+      type: 'CAPITAL_IN' as any,
+      amount: amount,
+      description: desc || 'Tambah Modal',
+      destinationAccountId: destId
+    };
+
+    await processSimpleUpdate(mutationData, destId, amount);
     setShowAddCapitalModal(false);
   };
 
-  const handleTransfer = (e: React.FormEvent) => {
+  const handleTransfer = async (e: React.FormEvent) => {
     e.preventDefault();
     const { sourceId, destId, amount, description, feeType, manualFee, chargedTo } = transferConfig;
 
@@ -172,24 +203,27 @@ export default function Home() {
 
     const sourceAcc = accounts.find(a => a.id === sourceId);
     const totalDeductionFromSource = chargedTo === 'SOURCE' ? parsedAmount + fee : parsedAmount;
+    const amountReceived = chargedTo === 'DESTINATION' ? parsedAmount - fee : parsedAmount;
     
     if (!sourceAcc || sourceAcc.balance < totalDeductionFromSource) { alert(`Saldo akun asal tidak mencukupi.`); return; }
 
-    setAccounts(accounts.map(acc => {
-      if (acc.id === sourceId) return { ...acc, balance: acc.balance - totalDeductionFromSource };
-      if (acc.id === destId) {
-        const amountReceived = chargedTo === 'DESTINATION' ? parsedAmount - fee : parsedAmount;
-        return { ...acc, balance: acc.balance + amountReceived };
-      }
-      return acc;
-    }));
+    const mutationData = {
+      date: new Date().toLocaleString(),
+      type: 'TRANSFER' as any,
+      amount: parsedAmount,
+      fee: fee,
+      description: description || `Mutasi (${feeType})`,
+      sourceAccountId: sourceId,
+      destinationAccountId: destId
+    };
 
-    setMutations(prev => [...prev, { id: `MUT-${Date.now()}`, date: new Date().toLocaleString(), type: 'TRANSFER', amount: parsedAmount, fee: fee, description: description || `Mutasi (${feeType})`, sourceAccountId: sourceId, destinationAccountId: destId }]);
+    await processInternalTransfer(mutationData, sourceId, destId, -totalDeductionFromSource, amountReceived);
+    
     setShowTransferModal(false);
     setTransferConfig({ amount: '', description: '', sourceId: '', destId: '', feeType: 'FREE', manualFee: '', chargedTo: 'SOURCE' });
   };
 
-  const handleSettlement = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleSettlement = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!showSettlementModal) return;
     const formData = new FormData(e.currentTarget);
@@ -202,13 +236,17 @@ export default function Home() {
 
     if (!destId) { alert("Akun tujuan settlement belum diset."); return; }
 
-    setAccounts(accounts.map(acc => {
-      if (acc.id === showSettlementModal.id) return { ...acc, balance: acc.balance - amount };
-      if (acc.id === destId) return { ...acc, balance: acc.balance + netAmount };
-      return acc;
-    }));
+    const mutationData = {
+      date: new Date().toLocaleString(),
+      type: 'SETTLEMENT' as any,
+      amount: amount,
+      fee: mdrFee,
+      description: `Settlement ${showSettlementModal.name}`,
+      sourceAccountId: showSettlementModal.id,
+      destinationAccountId: destId
+    };
 
-    setMutations(prev => [...prev, { id: `SET-${Date.now()}`, date: new Date().toLocaleString(), type: 'SETTLEMENT', amount: amount, fee: mdrFee, description: `Settlement ${showSettlementModal.name}`, sourceAccountId: showSettlementModal.id, destinationAccountId: destId }]);
+    await processInternalTransfer(mutationData, showSettlementModal.id, destId, -amount, netAmount);
     setShowSettlementModal(null);
   };
 
@@ -217,6 +255,8 @@ export default function Home() {
       <AppHeader />
 
       <main className="w-full p-4 md:p-8 pb-32 max-w-7xl mx-auto">
+        {dataLoading && <div className="text-center py-2 text-xs text-slate-400 animate-pulse">Mensinkronisasi data dengan cloud...</div>}
+
         {/* Modals & Overlays */}
         {activeTransactionType && (
           <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
