@@ -1,3 +1,5 @@
+"use client";
+
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { TransactionType, BANK_GROUPS, EWALLET_LIST, EMONEY_LIST, CashAccount, PaymentMethod, AccountType } from '../types';
 import { Save, RefreshCw, AlertCircle, Search, CheckCircle, RotateCcw, X, Wallet, CreditCard, Banknote, SplitSquareHorizontal } from 'lucide-react';

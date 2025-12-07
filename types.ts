@@ -55,6 +55,10 @@ export interface Transaction {
   sourceAccountId?: string; // Akun yang dipakai kirim uang
   paymentMethod?: PaymentMethod;
   paymentReceiverId?: string; // Akun yang terima uang (jika transfer/split)
+  
+  // For split data passing from form (temporary/loose type)
+  splitCashAmount?: string;
+  splitTransferAmount?: string;
 }
 
 export interface NavItem {
